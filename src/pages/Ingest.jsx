@@ -5,124 +5,128 @@ import { semanticChunk } from '../lib/hyperrag'
 import { formatBytes } from '../lib/constants'
 import { SectionHeader, Spinner, CatTag, ConfidenceBadge, EmptyState } from '../components/UI'
 
-const ACCEPTED_TYPES = '.pdf,.txt,.md,.docx,.epub'
+const ACCEPTED_TYPES = '.pdf,.txt,.md,.docx'
 const CATEGORIES = ['fact','principle','framework','insight','warning','definition','example']
 
-// ── Anthropic API call (identical to working MVP) ────────────────────────────
-async function callAnthropic(apiKey, systemPrompt, userContent, maxTokens = 2000) {
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: maxTokens,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userContent }],
-    }),
+// ── Convert file to base64 ────────────────────────────────────────────────────
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result.split(',')[1])
+    reader.onerror = reject
+    reader.readAsDataURL(file)
   })
-  const data = await resp.json()
-  if (!resp.ok) throw new Error(data.error?.message || `API error ${resp.status}`)
-  return data.content?.map(i => i.text || '').join('') || ''
 }
 
-// ── Robust JSON parser (handles markdown fences and stray text) ───────────────
+// ── Robust JSON parser ────────────────────────────────────────────────────────
 function parseJsonArray(text) {
-  // 1. Strip markdown fences
   let s = text.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim()
-  // 2. Try direct parse
   try { const p = JSON.parse(s); if (Array.isArray(p)) return p } catch {}
-  // 3. Find the array in the text
   const m = s.match(/\[[\s\S]*\]/)
   if (m) { try { const p = JSON.parse(m[0]); if (Array.isArray(p)) return p } catch {} }
   return null
 }
 
-// ── File → plain text (no npm deps, pure browser APIs) ───────────────────────
-async function readFileAsText(file) {
-  const ext = file.name.split('.').pop().toLowerCase()
-
-  // Plain text files — just read directly
-  if (['txt', 'md'].includes(ext)) {
-    return await file.text()
-  }
-
-  // DOCX — use mammoth from CDN (injected once)
-  if (['docx', 'doc'].includes(ext)) {
-    return await extractDocx(file)
-  }
-
-  // PDF — use pdf.js from CDN (injected once)
-  if (ext === 'pdf') {
-    return await extractPdf(file)
-  }
-
-  // Fallback
-  return await file.text()
-}
-
-// Inject a script tag once and return a promise that resolves when loaded
-const _loaded = {}
-function loadScript(url, globalKey) {
-  if (_loaded[globalKey]) return _loaded[globalKey]
-  _loaded[globalKey] = new Promise((resolve, reject) => {
-    if (window[globalKey]) { resolve(window[globalKey]); return }
-    const s = document.createElement('script')
-    s.src = url
-    s.onload = () => window[globalKey] ? resolve(window[globalKey]) : reject(new Error(`${globalKey} not found after load`))
-    s.onerror = () => reject(new Error(`Failed to load ${url}`))
-    document.head.appendChild(s)
-  })
-  return _loaded[globalKey]
-}
-
-async function extractPdf(file) {
-  const pdfjs = await loadScript(
-    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
-    'pdfjsLib'
-  )
-  pdfjs.GlobalWorkerOptions.workerSrc =
-    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-
-  const buf = await file.arrayBuffer()
-  const pdf = await pdfjs.getDocument({ data: buf }).promise
-  const pages = []
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i)
-    const tc = await page.getTextContent()
-    let txt = ''
-    for (const item of tc.items) {
-      if (item.str) {
-        txt += (txt && !txt.endsWith(' ') && !item.str.startsWith(' ') ? ' ' : '') + item.str
-      }
-    }
-    if (txt.trim()) pages.push(txt.trim())
-  }
-  if (!pages.length) throw new Error('PDF has no selectable text. Use the Paste Text tab instead.')
-  return pages.join('\n\n')
-}
-
-async function extractDocx(file) {
-  const mammoth = await loadScript(
-    'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js',
-    'mammoth'
-  )
-  const buf = await file.arrayBuffer()
-  const result = await mammoth.extractRawText({ arrayBuffer: buf })
-  if (!result?.value?.trim()) throw new Error('DOCX appears empty or unreadable.')
-  return result.value
-}
-
-// ── System prompt (identical structure to working MVP) ────────────────────────
+// ── System prompt ─────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are a precision knowledge distiller for MemOS, a memory compression system. Extract atomic, falsifiable, actionable memory nodes from the provided content.
-Rules: (1) Each node must be independently meaningful. (2) Prefer specific over vague. (3) Extract 6-12 nodes. (4) Output ONLY a valid JSON array of nodes, no other text.
-Schema: ${JSON.stringify({
-  concept: 'One clear testable statement of the idea (max 250 chars)',
-  category: 'one of [fact,principle,framework,insight,warning,definition,example]',
-  confidence: '0.0-1.0',
-  applications: 'When and how this idea is practically useful',
-  source_quote: 'Verbatim quote max 50 words',
-  tags: 'array of 2-4 lowercase keyword strings',
-})}`
+Rules: (1) Each node must be independently meaningful. (2) Prefer specific over vague. (3) Extract 6-12 nodes. (4) Output ONLY a valid JSON array of nodes, no other text, no markdown fences.
+Each node schema: {"concept":"One clear testable statement","category":"fact|principle|framework|insight|warning|definition|example","confidence":0.0-1.0,"applications":"practical use","source_quote":"verbatim quote max 50 words","tags":["tag1","tag2"]}`
+
+// ── Call Claude API via Vite proxy — supports PDF/DOCX natively ──────────────
+async function extractNodesFromFile(apiKey, file, title) {
+  const ext = file.name.split('.').pop().toLowerCase()
+  const isText = ['txt', 'md'].includes(ext)
+  const isPdf = ext === 'pdf'
+  const isDocx = ['docx', 'doc'].includes(ext)
+
+  let messages
+
+  if (isText) {
+    // Plain text — read directly and send as text
+    const text = await file.text()
+    messages = [{
+      role: 'user',
+      content: `Title: ${title}\n\nContent:\n${text.slice(0, 12000)}`
+    }]
+  } else if (isPdf) {
+    // PDF — Claude API reads PDFs natively via base64 document block
+    const b64 = await fileToBase64(file)
+    messages = [{
+      role: 'user',
+      content: [
+        {
+          type: 'document',
+          source: { type: 'base64', media_type: 'application/pdf', data: b64 }
+        },
+        {
+          type: 'text',
+          text: `Extract memory nodes from this document titled "${title}". Output ONLY the JSON array.`
+        }
+      ]
+    }]
+  } else if (isDocx) {
+    // DOCX — extract text using mammoth (npm package, imported properly)
+    const text = await extractDocxText(file)
+    messages = [{
+      role: 'user',
+      content: `Title: ${title}\n\nContent:\n${text.slice(0, 12000)}`
+    }]
+  } else {
+    // Fallback — try reading as text
+    const text = await file.text()
+    messages = [{
+      role: 'user',
+      content: `Title: ${title}\n\nContent:\n${text.slice(0, 12000)}`
+    }]
+  }
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'anthropic-beta': 'pdfs-2024-09-25',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 2000,
+      system: SYSTEM_PROMPT,
+      messages,
+    }),
+  })
+
+  const data = await resp.json()
+  if (!resp.ok) throw new Error(data.error?.message || `API error ${resp.status}: ${JSON.stringify(data)}`)
+  return data.content?.map(i => i.text || '').join('') || ''
+}
+
+// ── DOCX text extraction via mammoth (npm) ────────────────────────────────────
+async function extractDocxText(file) {
+  try {
+    const mammoth = await import('mammoth')
+    const mod = mammoth.default || mammoth
+    const buf = await file.arrayBuffer()
+    const result = await mod.extractRawText({ arrayBuffer: buf })
+    return result?.value || ''
+  } catch (e) {
+    throw new Error(`Could not read DOCX: ${e.message}. Try converting to PDF or TXT.`)
+  }
+}
+
+// ── Also extract plain text for chunking (RAG search) ────────────────────────
+async function extractTextForChunking(file) {
+  const ext = file.name.split('.').pop().toLowerCase()
+  if (['txt', 'md'].includes(ext)) return await file.text()
+  if (['docx', 'doc'].includes(ext)) return await extractDocxText(file)
+  // For PDFs, return empty — Claude handles the PDF directly, chunking less critical
+  if (ext === 'pdf') {
+    try { return await file.text() } catch { return '' }
+  }
+  try { return await file.text() } catch { return '' }
+}
+
 
 export default function IngestPage() {
   const { apiKey, addSource, updateSource, setChunks, addNodes, notify } = useStore(s => ({
@@ -164,30 +168,28 @@ export default function IngestPage() {
     const prog = (step, pct) => setJobProgress({ step, pct })
 
     try {
-      // Step 1: Extract text
-      prog('Reading file…', 15)
-      const rawText = await readFileAsText(file)
-      if (!rawText || rawText.trim().length < 30) {
-        throw new Error('No readable text found in file.')
+      prog('Reading file…', 20)
+
+      // Extract text for RAG chunking (best-effort, not required)
+      const rawText = await extractTextForChunking(file)
+      if (rawText && rawText.trim().length > 30) {
+        const chunks = semanticChunk(rawText, sourceId)
+        setChunks(sourceId, chunks)
+        prog(`Indexed ${chunks.length} chunks for search`, 40)
+      } else {
+        prog('Sending to Claude…', 40)
       }
-      prog(`Read ${rawText.length.toLocaleString()} characters`, 35)
 
-      // Step 2: Chunk for RAG search (stored, not used for extraction)
-      const chunks = semanticChunk(rawText, sourceId)
-      setChunks(sourceId, chunks)
-      prog(`Indexed ${chunks.length} chunks`, 50)
-
-      // Step 3: Call Anthropic (same pattern as working MVP)
-      prog('Extracting memory nodes…', 65)
-      const userContent = `Title: ${source.title}\n\nContent:\n${rawText.slice(0, 10000)}`
-      const raw = await callAnthropic(apiKey, SYSTEM_PROMPT, userContent, 2000)
+      // Call Claude — PDFs sent as native document blocks, no pdf.js needed
+      prog('Extracting memory nodes…', 55)
+      const raw = await extractNodesFromFile(apiKey, file, source.title)
 
       prog('Parsing nodes…', 85)
       const parsed = parseJsonArray(raw)
 
       if (!parsed || parsed.length === 0) {
         console.error('Raw API response:', raw)
-        throw new Error('No nodes returned. Check your API key and try again.')
+        throw new Error('No nodes returned. Raw response logged to console.')
       }
 
       const finalNodes = parsed.map((n, i) => ({

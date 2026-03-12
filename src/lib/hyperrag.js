@@ -10,8 +10,9 @@
 //   7. Citation grounding (every claim traced to exact source chunk)
 // ────────────────────────────────────────────────────────────────────────────
 
-const K2_ENDPOINT = 'https://api.k2think.ai/v1/chat/completions'
-const K2_MODEL = 'MBZUAI-IFM/K2-Think-v2'
+// All AI calls now use the Anthropic API via Vite proxy (/api/anthropic/...)
+const ANTHROPIC_ENDPOINT = 'https://api.anthropic.com/v1/messages'
+const ANTHROPIC_MODEL = 'claude-sonnet-4-5'
 
 // ── Text extraction ─────────────────────────────────────────────────────────
 
@@ -36,44 +37,79 @@ export async function extractTextFromFile(file) {
 
 async function extractPdfText(file) {
   try {
-    const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf')
-
-    // Disable the worker entirely — runs PDF parsing on the main thread.
-    // This is slightly slower but works on every platform with zero config.
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'noop'
-
     const arrayBuffer = await file.arrayBuffer()
-    const pdf = await pdfjsLib.getDocument({
-      data: new Uint8Array(arrayBuffer),
-      disableWorker: true,
-      useSystemFonts: true,
-    }).promise
-
-    const pageTexts = []
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i)
-      const content = await page.getTextContent()
-      let pageText = ''
-      for (const item of content.items) {
-        if (item.str) {
-          const needsSpace = pageText.length > 0 &&
-            !pageText.endsWith(' ') &&
-            !item.str.startsWith(' ')
-          pageText += (needsSpace ? ' ' : '') + item.str
-        }
-      }
-      if (pageText.trim()) pageTexts.push(`[Page ${i}]\n${pageText.trim()}`)
+    const bytes = new Uint8Array(arrayBuffer)
+    const text = extractTextFromPdfBytes(bytes)
+    if (!text || text.trim().length < 20) {
+      throw new Error('PDF has no selectable text — it may be a scanned image. Use the Paste Text tab instead.')
     }
-
-    if (pageTexts.length === 0) {
-      throw new Error('PDF has no selectable text — it may be a scanned image. Try the Paste Text tab instead.')
-    }
-    return pageTexts.join('\n\n')
+    return text
   } catch (e) {
-    console.error('PDF parse error:', e)
     throw new Error(e.message || 'Could not read PDF.')
   }
 }
+
+// Minimal PDF text extractor — reads BT...ET text blocks from raw PDF bytes.
+// Handles Tj, TJ, ' and " operators. No worker, no CDN, no dependencies.
+function extractTextFromPdfBytes(bytes) {
+  // Decode bytes to latin-1 string (preserves byte values for binary parsing)
+  let src = ''
+  for (let i = 0; i < bytes.length; i++) src += String.fromCharCode(bytes[i])
+
+  const parts = []
+
+  // Find all BT...ET blocks (text objects in PDF spec)
+  const btEtRe = /BT([\s\S]*?)ET/g
+  let btMatch
+  while ((btMatch = btEtRe.exec(src)) !== null) {
+    const block = btMatch[1]
+    const blockParts = []
+
+    // Match all text-showing operators in order:
+    // (text)Tj  [(text)]TJ  (text)'  (text)"
+    const opRe = /\(([^)]*)\)\s*(?:Tj|'|")|(\[([^\]]*)\])\s*TJ/g
+    let opMatch
+    while ((opMatch = opRe.exec(block)) !== null) {
+      if (opMatch[1] !== undefined) {
+        // Simple string: (text)Tj
+        blockParts.push(decodePdfString(opMatch[1]))
+      } else if (opMatch[3] !== undefined) {
+        // Array: [(text1)-100(text2)]TJ — extract all strings inside
+        const arr = opMatch[3]
+        const strRe = /\(([^)]*)\)/g
+        let strMatch
+        while ((strMatch = strRe.exec(arr)) !== null) {
+          const s = decodePdfString(strMatch[1])
+          if (s) blockParts.push(s)
+        }
+      }
+    }
+
+    if (blockParts.length > 0) {
+      parts.push(blockParts.join(''))
+    }
+  }
+
+  // Join blocks with spaces, collapse whitespace, remove non-printable chars
+  return parts
+    .join(' ')
+    .replace(/[^\x20-\x7E\n\r\t]/g, ' ')
+    .replace(/\s{3,}/g, '\n\n')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+}
+
+function decodePdfString(raw) {
+  // Handle common PDF string escapes
+  return raw
+    .replace(/\\n/g, ' ')
+    .replace(/\\r/g, ' ')
+    .replace(/\\t/g, ' ')
+    .replace(/\\([0-7]{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
+    .replace(/\\(.)/g, '$1')
+}
+
+function loadScript() {} // no longer needed
 
 async function extractDocxText(file) {
   try {
@@ -329,64 +365,62 @@ export async function hyperResearchAnswer({
   apiKey,
   conversationHistory = [],
   onStream,
-  scope = 'all', // 'all' | sourceId
+  scope = 'all',
 }) {
-  // 1. Filter chunks by scope
+  // 1. Filter by scope
   const scopedChunks = scope === 'all' ? chunks : chunks.filter(c => c.source_id === scope)
-  const scopedNodes = scope === 'all' ? nodes : nodes.filter(n => n.source_id === scope)
+  const scopedNodes  = scope === 'all' ? nodes  : nodes.filter(n => n.source_id === scope)
 
-  // 2. Decompose query
-  const subQueries = await decomposeQuery(query, apiKey)
+  // 2. Retrieve relevant chunks via BM25
+  const retrieved = scopedChunks.length > 0
+    ? hyperRetrieve(query, scopedChunks, 12)
+    : []
 
-  // 3. Multi-query retrieval
-  const retrieved = multiQueryRetrieve(subQueries, scopedChunks, 10)
-
-  // 4. Assemble context from retrieved chunks
+  // 3. Build source map
   const sourceMap = Object.fromEntries(sources.map(s => [s.id, s]))
-  const docContext = assembleContext(retrieved, sourceMap)
 
-  // 5. Gather relevant memory nodes
-  const nodeContext = scopedNodes
-    .slice(0, 20)
-    .map((n, i) => `[NODE ${i + 1}] ${n.concept} (${n.category}, confidence: ${n.confidence})`)
-    .join('\n')
+  // 4. Assemble document context — label each source clearly
+  const docContext = retrieved.length > 0
+    ? retrieved.map((r, i) => {
+        const src = sourceMap[r.chunk.source_id]
+        const label = src ? `${src.title}${src.author ? ` by ${src.author}` : ''}` : 'Unknown source'
+        return `[SOURCE ${i + 1}: ${label}]\n${r.chunk.text}`
+      }).join('\n\n---\n\n')
+    : ''
 
-  // 6. Build system prompt
-  const systemPrompt = `You are MemOS HyperResearch — an elite knowledge synthesis engine.
-You answer questions by deeply analyzing provided document chunks and memory nodes.
+  // 5. Memory nodes — only include ones from same source scope
+  const nodeContext = scopedNodes.length > 0
+    ? scopedNodes.slice(0, 15).map(n =>
+        `• ${n.concept} (${n.category})`
+      ).join('\n')
+    : ''
 
-Your capabilities:
-- Multi-document synthesis: connect ideas across sources
-- Evidence grounding: cite specific sources for every claim  
-- Gap detection: identify what information is missing
-- Contradiction surfacing: flag conflicting information between sources
-- Insight generation: surface non-obvious connections
-- Structured reasoning: break down complex questions
+  // 6. System prompt — direct, conversational, no internal monologue
+  const systemPrompt = `You are a helpful AI assistant embedded in MemOS, a personal knowledge management app. You answer questions based on the user's uploaded documents.
 
-When answering:
-1. Always cite sources using [SOURCE N] references
-2. Distinguish between what documents say vs your synthesis
-3. If information is insufficient, say so clearly and suggest what additional research would help
-4. Use markdown formatting for clarity (headers, bullets, bold key terms)
-5. End with a "Key Takeaways" section for complex answers
+RULES:
+- Answer the user's question directly and helpfully — like a smart colleague, not an academic paper
+- Use the document content provided below as your primary source of truth
+- Cite sources inline as [SOURCE 1], [SOURCE 2] etc. when referencing specific content
+- If the documents don't contain relevant info, say so briefly and answer from general knowledge if appropriate
+- Keep answers concise unless the question requires depth
+- Do NOT narrate your thinking process or reasoning steps — just answer
+- Do NOT start with "We have a user asking..." or any internal planning language
+- Use markdown naturally (bold for emphasis, bullets for lists) but don't over-structure simple answers
 
-AVAILABLE DOCUMENT CONTEXT:
-${docContext || 'No documents uploaded for this scope.'}
+${docContext ? `DOCUMENT CONTEXT:\n${docContext}` : 'No documents have been uploaded yet.'}
 
-MEMORY NODES (extracted insights):
-${nodeContext || 'No memory nodes available.'}
+${nodeContext ? `KEY CONCEPTS FROM DOCUMENTS:\n${nodeContext}` : ''}`
 
-CONVERSATION CONTEXT: You have access to conversation history below. Maintain continuity.`
-
-  // 7. Build messages with history
+  // 7. Build messages with conversation history
   const messages = [
-    ...conversationHistory.slice(-10).map(m => ({ role: m.role, content: m.content })),
+    ...conversationHistory.slice(-8).map(m => ({ role: m.role, content: m.content })),
     { role: 'user', content: query },
   ]
 
-  // 8. Stream the answer
+  // 8. Stream via Anthropic API
   let fullAnswer = ''
-  await streamClaude(apiKey, {
+  await streamAnthropic(apiKey, {
     system: systemPrompt,
     messages,
     max_tokens: 2000,
@@ -396,18 +430,6 @@ CONVERSATION CONTEXT: You have access to conversation history below. Maintain co
     },
   })
 
-  // 9. Check if answer needs follow-up retrieval (iterative refinement)
-  const needsMore = fullAnswer.includes('insufficient information') ||
-    fullAnswer.includes('cannot find') ||
-    fullAnswer.includes('not in the provided')
-
-  if (needsMore && retrieved.length < scopedChunks.length) {
-    // Do a second-pass retrieval with expanded query
-    const expandedQueries = [...subQueries, query + ' details', query + ' examples']
-    const moreChunks = multiQueryRetrieve(expandedQueries, scopedChunks, 15)
-    // The streaming already happened, so we just enrich the metadata
-  }
-
   return {
     answer: fullAnswer,
     sources_used: retrieved.map(r => ({
@@ -416,7 +438,7 @@ CONVERSATION CONTEXT: You have access to conversation history below. Maintain co
       score: r.score,
       preview: r.chunk.text.slice(0, 120),
     })),
-    sub_queries: subQueries,
+    sub_queries: [query],
     chunks_retrieved: retrieved.length,
   }
 }
@@ -426,7 +448,6 @@ CONVERSATION CONTEXT: You have access to conversation history below. Maintain co
 export async function generateRecallQuestion(node, apiKey) {
   const prompt = `Generate a retrieval practice question for this memory node.
 The question must require reconstruction from memory, not recognition.
-Vary types: explain-in-own-words | apply-to-scenario | compare-contrast | identify-contradiction
 
 NODE:
 Concept: ${node.concept}
@@ -436,7 +457,7 @@ Applications: ${node.applications}
 Return ONLY JSON: {"question_type": "...", "question_text": "...", "ideal_answer_outline": "..."}`
 
   try {
-    const raw = await callClaude(apiKey, { system: 'Return only valid JSON.', user: prompt, max_tokens: 400 })
+    const raw = await callAnthropic(apiKey, 'Return only valid JSON, no other text.', prompt, 400)
     const clean = raw.replace(/```json|```/g, '').trim()
     return JSON.parse(clean)
   } catch {
@@ -445,29 +466,6 @@ Return ONLY JSON: {"question_type": "...", "question_text": "...", "ideal_answer
       question_text: `In your own words, explain: "${node.concept.slice(0, 100)}..."`,
       ideal_answer_outline: node.applications,
     }
-  }
-}
-
-// ── Contradiction detection ──────────────────────────────────────────────────
-
-export async function detectContradictions(nodeA, nodeB, apiKey) {
-  const prompt = `Compare two memory nodes and determine their relationship.
-
-NODE A: ${nodeA.concept} (from: ${nodeA.source_ref?.title})
-NODE B: ${nodeB.concept} (from: ${nodeB.source_ref?.title})
-
-Return ONLY JSON: {
-  "relationship": "contradicts|supports|orthogonal|same_idea",
-  "explanation": "brief explanation",
-  "confidence": 0.0-1.0
-}`
-
-  try {
-    const raw = await callClaude(apiKey, { system: 'Return only valid JSON.', user: prompt, max_tokens: 300 })
-    const clean = raw.replace(/```json|```/g, '').trim()
-    return JSON.parse(clean)
-  } catch {
-    return { relationship: 'orthogonal', explanation: 'Could not analyze', confidence: 0.5 }
   }
 }
 
@@ -483,146 +481,71 @@ Return JSON: {
   "summary": "2-3 sentence overview",
   "key_themes": ["theme1", "theme2", "theme3"],
   "content_type": "textbook|research_paper|podcast_transcript|article|other",
-  "estimated_reading_time": "X min",
   "knowledge_density": "low|medium|high"
 }`
 
   try {
-    const raw = await callClaude(apiKey, { system: 'Return only valid JSON.', user: prompt, max_tokens: 500 })
+    const raw = await callAnthropic(apiKey, 'Return only valid JSON, no other text.', prompt, 500)
     const clean = raw.replace(/```json|```/g, '').trim()
     return JSON.parse(clean)
   } catch {
-    return {
-      summary: 'Document processed successfully.',
-      key_themes: [],
-      content_type: 'other',
-      estimated_reading_time: '?',
-      knowledge_density: 'medium',
-    }
+    return { summary: 'Document processed.', key_themes: [], content_type: 'other', knowledge_density: 'medium' }
   }
 }
 
-// ── Direct K2 call (used by Ingest — mirrors the working MVP exactly) ─────────
-export async function callK2Direct(apiKey, systemPrompt, userPrompt, max_tokens = 4000) {
-  const resp = await fetch(K2_ENDPOINT, {
+// ── Anthropic API — non-streaming ────────────────────────────────────────────
+export async function callAnthropic(apiKey, system, user, max_tokens = 1000) {
+  const resp = await fetch(ANTHROPIC_ENDPOINT, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
     },
     body: JSON.stringify({
-      model: K2_MODEL,
+      model: ANTHROPIC_MODEL,
       max_tokens,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user',   content: userPrompt   },
-      ],
+      system,
+      messages: [{ role: 'user', content: user }],
     }),
   })
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}))
-    throw new Error(err.error?.message || `K2 API error ${resp.status}: ${resp.statusText}`)
-  }
   const data = await resp.json()
-  const text = data.choices?.[0]?.message?.content || ''
-  if (!text) throw new Error('K2 returned an empty response. Check your API key and model access.')
-  return text
-}
-
-// ── Robust JSON extraction from reasoning model output ───────────────────────
-// K2-Think-v2 is a reasoning model — it thinks out loud before answering.
-// The actual JSON may come after <think>...</think> blocks or after prose.
-export function extractJsonFromModelOutput(raw) {
-  // 1. Strip <think>...</think> reasoning blocks (K2/DeepSeek style)
-  let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
-
-  // 2. Strip markdown fences
-  cleaned = cleaned.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim()
-
-  // 3. Try to find the last JSON array in the output
-  //    (reasoning models often write prose THEN the JSON at the end)
-  const arrayMatches = [...cleaned.matchAll(/(\[[\s\S]*?\])/g)]
-  if (arrayMatches.length > 0) {
-    // Try from last match backwards (the final array is most likely the answer)
-    for (let i = arrayMatches.length - 1; i >= 0; i--) {
-      try {
-        const parsed = JSON.parse(arrayMatches[i][1])
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed
-      } catch { /* try next */ }
-    }
+  if (!resp.ok) {
+    console.error('Anthropic API error:', resp.status, JSON.stringify(data))
+    throw new Error(data.error?.message || `API error ${resp.status}: ${JSON.stringify(data)}`)
   }
-
-  // 4. Try greedy match for the largest array in the text
-  const greedyMatch = cleaned.match(/\[[\s\S]*\]/)
-  if (greedyMatch) {
-    try {
-      const parsed = JSON.parse(greedyMatch[0])
-      if (Array.isArray(parsed)) return parsed
-    } catch { /* fall through */ }
-  }
-
-  // 5. Last resort: try parsing the whole cleaned string
-  try {
-    const parsed = JSON.parse(cleaned)
-    if (Array.isArray(parsed)) return parsed
-    if (parsed && typeof parsed === 'object') return [parsed]
-  } catch { /* give up */ }
-
-  return null
+  return data.content?.map(i => i.text || '').join('') || ''
 }
 
-// ── K2-Think-v2 API wrappers (OpenAI-compatible) ─────────────────────────────
-
-// Builds OpenAI-format messages array, injecting system prompt as first message
-function buildMessages(system, messages) {
-  const sys = system ? [{ role: 'system', content: system }] : []
-  return [...sys, ...messages]
-}
-
-export async function callClaude(apiKey, { system, user, messages, max_tokens = 1000 }) {
-  const msgs = buildMessages(system, messages || [{ role: 'user', content: user }])
-  const resp = await fetch(K2_ENDPOINT, {
+// ── Anthropic API — streaming ─────────────────────────────────────────────────
+export async function streamAnthropic(apiKey, { system, messages, max_tokens = 2000, onChunk }) {
+  console.log('streamAnthropic called, key prefix:', apiKey?.slice(0, 20), 'length:', apiKey?.length)
+  const resp = await fetch(ANTHROPIC_ENDPOINT, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
     },
     body: JSON.stringify({
-      model: K2_MODEL,
-      max_tokens,
-      messages: msgs,
-    }),
-  })
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}))
-    throw new Error(err.error?.message || `K2 API error ${resp.status}`)
-  }
-  const data = await resp.json()
-  // OpenAI-compatible response: choices[0].message.content
-  return data.choices?.[0]?.message?.content || ''
-}
-
-export async function streamClaude(apiKey, { system, messages, max_tokens = 2000, onChunk }) {
-  const msgs = buildMessages(system, messages)
-  const resp = await fetch(K2_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: K2_MODEL,
+      model: ANTHROPIC_MODEL,
       max_tokens,
       stream: true,
-      messages: msgs,
+      system,
+      messages,
     }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}))
-    throw new Error(err.error?.message || `K2 API error ${resp.status}`)
+    console.error('Anthropic stream error:', resp.status, JSON.stringify(err))
+    throw new Error(err.error?.message || `API error ${resp.status}: ${JSON.stringify(err)}`)
   }
+
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
+
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
@@ -632,12 +555,40 @@ export async function streamClaude(apiKey, { system, messages, max_tokens = 2000
       if (payload === '[DONE]') continue
       try {
         const json = JSON.parse(payload)
-        // OpenAI-compatible streaming: choices[0].delta.content
-        const text = json.choices?.[0]?.delta?.content || ''
+        // Anthropic streaming format: content_block_delta with delta.text
+        const text = json.delta?.text || ''
         if (text) onChunk?.(text)
-      } catch { /* skip malformed SSE lines */ }
+      } catch { /* skip malformed lines */ }
     }
   }
+}
+
+// ── Legacy K2 wrappers (kept for compatibility, now route to Anthropic) ───────
+export async function callClaude(apiKey, { system, user, messages, max_tokens = 1000 }) {
+  const userMsg = user || messages?.find(m => m.role === 'user')?.content || ''
+  return callAnthropic(apiKey, system || '', userMsg, max_tokens)
+}
+
+export async function streamClaude(apiKey, { system, messages, max_tokens = 2000, onChunk }) {
+  return streamAnthropic(apiKey, { system, messages, max_tokens, onChunk })
+}
+
+// ── K2 direct call (kept for compatibility) ───────────────────────────────────
+export async function callK2Direct(apiKey, systemPrompt, userPrompt, max_tokens = 3000) {
+  return callAnthropic(apiKey, systemPrompt, userPrompt, max_tokens)
+}
+
+export function extractJsonFromModelOutput(raw) {
+  let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  cleaned = cleaned.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim()
+  const arrayMatches = [...cleaned.matchAll(/(\[[\s\S]*?\])/g)]
+  for (let i = arrayMatches.length - 1; i >= 0; i--) {
+    try { const p = JSON.parse(arrayMatches[i][1]); if (Array.isArray(p) && p.length > 0) return p } catch {}
+  }
+  const greedyMatch = cleaned.match(/\[[\s\S]*\]/)
+  if (greedyMatch) { try { const p = JSON.parse(greedyMatch[0]); if (Array.isArray(p)) return p } catch {} }
+  try { const p = JSON.parse(cleaned); if (Array.isArray(p)) return p } catch {}
+  return null
 }
 
 // ── Stopwords ────────────────────────────────────────────────────────────────
