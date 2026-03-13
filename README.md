@@ -1,61 +1,85 @@
-# MemOS — Neuro-Optimized Memory OS
+# MemOS — Deployment Guide
 
-> Not a note app. A neuro-optimized memory OS with HyperRAG intelligence.
+## Architecture
+```
+React (Vite) ──► Express (Node) ──► PostgreSQL
+  Render Static    Render Web        Render DB (free)
+```
 
-## Quick Start
+---
 
+## Deploy to Render (free, permanent storage)
+
+### Step 1 — Push code to GitHub
 ```bash
+git init
+git add .
+git commit -m "MemOS with Postgres backend"
+git remote add origin https://github.com/YOUR_USERNAME/memos.git
+git push -u origin main
+```
+
+### Step 2 — Create Render account
+Go to https://render.com and sign up (free).
+
+### Step 3 — Deploy with render.yaml (one click)
+1. In Render dashboard → click **New** → **Blueprint**
+2. Connect your GitHub repo
+3. Render reads `render.yaml` automatically and creates:
+   - A **Web Service** (Express + React frontend)
+   - A **PostgreSQL database** (free, permanent)
+4. Click **Apply** — deploy takes ~3 minutes
+
+### Step 4 — Update FRONTEND_URL in render.yaml
+After deploy, Render gives you a URL like `https://memos-app.onrender.com`.
+Update `render.yaml` line:
+```yaml
+value: https://memos-app.onrender.com   # ← your actual URL
+```
+Commit and push — Render auto-redeploys.
+
+### Step 5 — Open the app
+Visit your Render URL, enter your Anthropic API key, done! 🎉
+
+---
+
+## Run locally
+
+### Prerequisites
+- Node 18+
+- PostgreSQL running locally (or use a free [Neon](https://neon.tech) connection string)
+
+### Setup
+```bash
+# 1. Install frontend deps
 npm install
-npm run dev
-# Open http://localhost:3000
-# Click "Connect API Key" → enter your Anthropic key
+
+# 2. Install server deps
+cd server && npm install && cd ..
+
+# 3. Configure server env
+cp server/.env.example server/.env
+# Edit server/.env and set DATABASE_URL to your Postgres connection string
+
+# 4. Start both servers (two terminals)
+npm run dev           # Terminal 1: Vite on port 5173
+npm run dev:server    # Terminal 2: Express on port 3001
 ```
 
-## Project Structure
+Visit http://localhost:5173
 
-```
-src/
-├── App.jsx              # Root app + routing
-├── styles.css           # Global design system
-├── store/index.js       # Zustand store (FSRS + all state)
-├── lib/
-│   ├── hyperrag.js      # HyperRAG engine (7-layer AI retrieval)
-│   └── constants.js     # Shared constants + utilities
-├── components/
-│   ├── UI.jsx           # Design primitives
-│   ├── Sidebar.jsx      # Navigation
-│   └── ApiKeyModal.jsx  # API setup
-└── pages/
-    ├── Dashboard.jsx    # Overview + stats
-    ├── Ingest.jsx       # Document upload + extraction
-    ├── Library.jsx      # Source browser + per-doc chat
-    ├── Research.jsx     # HyperResearch global Q&A
-    ├── Review.jsx       # FSRS-4.5 spaced recall
-    ├── Graph.jsx        # Interactive knowledge graph
-    ├── Analytics.jsx    # Memory health analytics
-    └── Settings.jsx     # Config + export
-```
+---
 
-## HyperRAG — 7 Layers Beyond Standard RAG
+## Free Postgres without installing anything locally
+Use [Neon](https://neon.tech) — free Postgres in the cloud, no credit card:
+1. Sign up at neon.tech
+2. Create a project → copy the connection string
+3. Paste it as `DATABASE_URL` in `server/.env`
+4. Run `npm run dev:server` — schema creates automatically
 
-1. Semantic chunking (paragraph-boundary aware)
-2. LLM query decomposition (complex → sub-queries)
-3. BM25 multi-signal scoring (not just cosine similarity)
-4. Multi-query fusion with score boosting
-5. Adjacent chunk deduplication
-6. Cross-source synthesis (all docs in one context window)
-7. Memory node enrichment (structured knowledge layer)
+---
 
-## Swap to K2-Think-v2
-
-In `src/lib/hyperrag.js` line 6-7:
-```js
-const CLAUDE_MODEL = 'MBZUAI-IFM/K2-Think-v2'
-const CLAUDE_ENDPOINT = 'https://api.k2think.ai/v1/chat/completions'
-```
-
-## Build for Production
-
-```bash
-npm run build   # Output in dist/
-```
+## Data persistence
+- All sources, chunks, nodes, and chat history live in Postgres
+- Data survives browser clears, device switches, and redeploys
+- Free Render Postgres: 1 GB storage, never expires
