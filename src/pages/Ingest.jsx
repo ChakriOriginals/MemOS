@@ -262,7 +262,7 @@ export default function IngestPage() {
     <div className="fade-up" style={{ padding: '32px 36px', maxWidth: 1100 }}>
       <SectionHeader
         title="Ingest Content"
-        subtitle="Upload documents, paste text, or add URLs — MemOS extracts atomic memory nodes automatically"
+        subtitle="Upload documents, paste text, or add URLs: MemOS extracts atomic memory nodes automatically"
       />
 
       {/* Tab bar */}

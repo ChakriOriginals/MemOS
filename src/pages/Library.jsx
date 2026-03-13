@@ -141,17 +141,17 @@ export default function LibraryPage() {
 
 function SourceDetail({ source, nodes, chunks, onDelete }) {
   const [tab, setTab] = useState('chat')
-  const { apiKey, chats, addMessage, clearChat, notify } = useStore(s => ({
+  const { apiKey, notify } = useStore(s => ({
     apiKey: s.apiKey,
-    chats: s.chats,
-    addMessage: s.addMessage,
-    clearChat: s.clearChat,
     notify: s.notify,
   }))
   const allChunks = useStore(s => s.chunks || [])
   const allSources = useStore(s => s.sources)
 
-  const messages = chats[source.id] || []
+  // Per-source chat stored in local state (not persisted — use Research for persistent chat)
+  const [messages, setMessages] = useState([])
+  const addMessage = (_, msg) => setMessages(prev => [...prev, msg])
+
   const [query, setQuery] = useState('')
   const [thinking, setThinking] = useState(false)
   const [streamingText, setStreamingText] = useState('')

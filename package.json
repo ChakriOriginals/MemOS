@@ -1,7 +1,7 @@
 {
   "name": "memos-ai",
   "version": "1.0.0",
-  "description": "MemOS - Neuro-optimized Memory OS",
+  "description": "MemOS The Neuro-optimized Memory OS",
   "scripts": {
     "dev": "vite --port 5173",
     "dev:server": "cd server && node --watch index.js",
